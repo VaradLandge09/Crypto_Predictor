@@ -1,17 +1,24 @@
+# Add these imports at the very top of flask_api.py (BEFORE any other imports)
+import os
+import time
+import random
+
+# Suppress TensorFlow warnings and CUDA errors
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU/CUDA
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
-import os
 import logging
 from datetime import datetime
 import traceback
 import requests
 import pandas as pd
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from crypto_predictor import ImprovedCryptoPricePredictor
-
-# Import the improved predictor
-# from improved_crypto_predictor import ImprovedCryptoPricePredictor
 
 app = Flask(__name__)
 CORS(app)
@@ -24,29 +31,101 @@ logger = logging.getLogger(__name__)
 predictors_cache = {}
 MODEL_DIR = 'improved_models'
 
-# def get_crypto_data_api(symbol='bitcoin', days=60):
-#     """
-#     Fetch real-time crypto data for predictions.
-#     """
-#     days = max(days, 90)
-#     try:
-#         url = f"https://api.coingecko.com/api/v3/coins/{symbol}/market_chart"
-#         params = {
-#             'vs_currency': 'usd', 
-#             'days': days,
-#             'interval': 'hourly' if days <= 30 else 'daily'
-#         }
+# API rate limiting variables
+last_api_call = 0
+API_CALL_DELAY = 2  # seconds between API calls
+
+def get_crypto_data_api_improved(symbol='bitcoin', days=60):
+    """
+    Improved crypto data fetching with rate limiting and retry logic.
+    """
+    global last_api_call
+    
+    try:
+        # Rate limiting - wait between API calls
+        current_time = time.time()
+        time_since_last_call = current_time - last_api_call
+        if time_since_last_call < API_CALL_DELAY:
+            sleep_time = API_CALL_DELAY - time_since_last_call + random.uniform(0.5, 1.5)
+            print(f"Rate limiting: waiting {sleep_time:.1f} seconds...")
+            time.sleep(sleep_time)
         
-#         response = requests.get(url, params=params, timeout=10)
-#         response.raise_for_status()
-#         data = response.json()
+        last_api_call = time.time()
         
-#         prices = [float(price[1]) for price in data['prices']]
-#         return prices
+        # Always fetch more data than requested to account for cleaning
+        fetch_days = min(max(days * 1.5, 90), 365)  # Ensure not more than 365
+        print(f"Fetch days calculated: {fetch_days}")
         
-#     except Exception as e:
-#         logger.error(f"Error fetching {symbol} data: {e}")
-#         return None
+        url = f"https://api.coingecko.com/api/v3/coins/{symbol}/market_chart"
+        params = {
+            'vs_currency': 'usd', 
+            'days': fetch_days,
+            'interval': 'hourly' if fetch_days <= 30 else 'daily'
+        }
+        
+        print(f"Fetching {symbol} data for {fetch_days} days (requested: {days})")
+        
+        # Create session with retry strategy
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            backoff_factor=2,
+            respect_retry_after_header=True
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Make the request with longer timeout
+        response = session.get(url, params=params, timeout=30)
+        
+        # Handle rate limiting specifically
+        if response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 60))
+            print(f"Rate limited. Waiting {retry_after} seconds...")
+            time.sleep(retry_after + random.uniform(1, 5))
+            
+            # Retry once more
+            response = session.get(url, params=params, timeout=30)
+        
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'prices' not in data or len(data['prices']) == 0:
+            raise ValueError("No price data received from API")
+        
+        prices = [float(price[1]) for price in data['prices']]
+        
+        print(f"Retrieved {len(prices)} price points")
+        
+        # Basic validation
+        if len(prices) < 50:
+            raise ValueError(f"Insufficient data from API: only {len(prices)} points")
+        
+        # If we have way more data than needed, trim to reasonable size for performance
+        if len(prices) > days * 3:
+            prices = prices[-(days * 2):]  # Keep last 2x requested days
+            print(f"Trimmed to {len(prices)} most recent price points")
+        
+        return prices
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            logger.error(f"Rate limit exceeded for {symbol}. Please try again later.")
+            return None
+        else:
+            logger.error(f"HTTP error fetching {symbol} data: {e}")
+            return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network error fetching {symbol} data: {e}")
+        return None
+    except ValueError as e:
+        logger.error(f"Data validation error for {symbol}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error fetching {symbol} data: {e}")
+        return None
 
 def load_predictor(symbol):
     """
@@ -60,6 +139,7 @@ def load_predictor(symbol):
     feature_scaler_path = f"{MODEL_DIR}/{symbol}_feature_scaler.pkl"
     
     if not all(os.path.exists(path) for path in [model_path, price_scaler_path, feature_scaler_path]):
+        logger.warning(f"Model files not found for {symbol}")
         return None
     
     try:
@@ -68,101 +148,133 @@ def load_predictor(symbol):
             predictors_cache[symbol] = predictor
             logger.info(f"Loaded model for {symbol}")
             return predictor
+        else:
+            logger.error(f"Failed to load model for {symbol}")
+            return None
     except Exception as e:
         logger.error(f"Error loading model for {symbol}: {e}")
-    
-    return None
+        return None
+
+def validate_symbol(symbol):
+    """Basic symbol validation"""
+    if not symbol or not isinstance(symbol, str):
+        return False
+    # Basic validation - can be expanded with more symbols
+    symbol = symbol.lower()
+    return len(symbol) > 0 and symbol.isalnum()
+
+def validate_prices(prices):
+    """Validate price data"""
+    try:
+        prices = [float(p) for p in prices]
+        if len(prices) < 90:
+            return None, f"Need at least 90 price points, got {len(prices)}"
+        if any(p <= 0 for p in prices):
+            return None, "All prices must be positive numbers"
+        return prices, None
+    except (ValueError, TypeError):
+        return None, "All prices must be valid numbers"
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Enhanced health check endpoint."""
-    # Check available models
-    available_models = []
-    if os.path.exists(MODEL_DIR):
-        for file in os.listdir(MODEL_DIR):
-            if file.endswith('_improved_model.h5'):
-                symbol = file.replace('_improved_model.h5', '')
-                available_models.append(symbol)
-    
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'available_models': available_models,
-        'cached_predictors': list(predictors_cache.keys())
-    })
+    try:
+        # Check available models
+        available_models = []
+        if os.path.exists(MODEL_DIR):
+            for file in os.listdir(MODEL_DIR):
+                if file.endswith('_improved_model.h5'):
+                    symbol = file.replace('_improved_model.h5', '')
+                    available_models.append(symbol)
+        
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'available_models': available_models,
+            'cached_predictors': list(predictors_cache.keys())
+        })
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
 
-# @app.route('/predict/<symbol>', methods=['GET', 'POST'])
-# def predict_crypto(symbol):
-#     """
-#     Predict cryptocurrency price for a specific symbol.
-    
-#     GET: Uses real-time data from API
-#     POST: Uses provided price data
-#     """
-#     try:
-#         symbol = symbol.lower()
+@app.route('/predict/<symbol>', methods=['GET', 'POST'])
+def predict_crypto(symbol):
+    """
+    Improved prediction endpoint with better data handling.
+    """
+    try:
+        symbol = symbol.lower()
         
-#         # Load predictor
-#         predictor = load_predictor(symbol)
-#         if not predictor:
-#             return jsonify({
-#                 'error': 'Model not found',
-#                 'message': f'No trained model available for {symbol}. Please train the model first.'
-#             }), 404
+        # Validate symbol
+        if not validate_symbol(symbol):
+            return jsonify({
+                'error': 'Invalid symbol',
+                'message': 'Symbol must be a valid alphanumeric string'
+            }), 400
         
-#         # Get price data
-#         if request.method == 'GET':
-#             days = request.args.get('days', 60, type=int)
-#             prices = get_crypto_data_api(symbol, days)
-#             print(len(prices))
-#             if not prices:
-#                 return jsonify({
-#                     'error': 'Data fetch failed',
-#                     'message': f'Could not fetch real-time data for {symbol}'
-#                 }), 500
+        # Load predictor
+        predictor = load_predictor(symbol)
+        if not predictor:
+            return jsonify({
+                'error': 'Model not found',
+                'message': f'No trained model available for {symbol}. Please train the model first.'
+            }), 404
         
-#         else:  # POST request
-#             data = request.get_json()
-#             if not data or 'prices' not in data:
-#                 return jsonify({
-#                     'error': 'Invalid request',
-#                     'message': 'POST request must contain "prices" field'
-#                 }), 400
+        # Get price data
+        if request.method == 'GET':
+            days = request.args.get('days', 90, type=int)
+            days = max(min(days, 365), 90)  # Ensure between 90 and 365
             
-#             prices = data['prices']
+            prices = get_crypto_data_api_improved(symbol, days)
             
-#             # Validate prices
-#             try:
-#                 prices = [float(p) for p in prices]
-#             except (ValueError, TypeError):
-#                 return jsonify({
-#                     'error': 'Invalid price data',
-#                     'message': 'All prices must be valid numbers'
-#                 }), 400
+            if not prices:
+                return jsonify({
+                    'error': 'Data fetch failed',
+                    'message': f'Could not fetch real-time data for {symbol}'
+                }), 500
         
-#         # Make prediction
-#         result = predictor.predict(prices)
+        else:  # POST request
+            data = request.get_json()
+            if not data or 'prices' not in data:
+                return jsonify({
+                    'error': 'Invalid request',
+                    'message': 'POST request must contain "prices" field'
+                }), 400
+            
+            prices, error_msg = validate_prices(data['prices'])
+            if prices is None:
+                return jsonify({
+                    'error': 'Invalid price data',
+                    'message': error_msg
+                }), 400
         
-#         # Add metadata
-#         result.update({
-#             'symbol': symbol,
-#             'timestamp': datetime.now().isoformat(),
-#             'current_price': prices[-1],
-#             'data_points_used': len(prices),
-#             'prediction_method': 'improved_lstm'
-#         })
+        # Make prediction
+        result = predictor.predict(prices)
         
-#         logger.info(f"Prediction for {symbol}: {result['predicted_price']:.2f} ({result['direction']})")
+        # Add metadata
+        result.update({
+            'symbol': symbol,
+            'timestamp': datetime.now().isoformat(),
+            'current_price': prices[-1],
+            'total_data_points': len(prices),
+            'prediction_method': 'adaptive_lstm'
+        })
         
-#         return jsonify(result)
+        logger.info(f"Prediction for {symbol}: {result.get('predicted_price', 'N/A'):.2f} ({result.get('direction', 'N/A')})")
         
-#     except Exception as e:
-#         logger.error(f"Error in prediction for {symbol}: {str(e)}")
-#         logger.error(traceback.format_exc())
-#         return jsonify({
-#             'error': 'Prediction failed',
-#             'message': str(e)
-#         }), 500
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error in prediction for {symbol}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'error': 'Prediction failed',
+            'message': str(e)
+        }), 500
 
 @app.route('/train/<symbol>', methods=['POST'])
 def train_model_endpoint(symbol):
@@ -171,10 +283,18 @@ def train_model_endpoint(symbol):
     """
     try:
         symbol = symbol.lower()
+        
+        # Validate symbol
+        if not validate_symbol(symbol):
+            return jsonify({
+                'error': 'Invalid symbol',
+                'message': 'Symbol must be a valid alphanumeric string'
+            }), 400
+        
         data = request.get_json() or {}
         
-        days = data.get('days', 365)
-        epochs = data.get('epochs', 100)
+        days = max(min(data.get('days', 365), 365), 200)  # Between 200 and 365
+        epochs = max(min(data.get('epochs', 100), 200), 50)  # Between 50 and 200
         
         logger.info(f"Starting training for {symbol} with {days} days of data")
         
@@ -216,9 +336,9 @@ def train_model_endpoint(symbol):
             'message': f'Model for {symbol} trained successfully',
             'symbol': symbol,
             'training_data_points': len(prices),
-            'epochs_completed': len(history['loss']),
-            'final_loss': float(history['loss'][-1]),
-            'final_val_loss': float(history['val_loss'][-1]) if 'val_loss' in history else None,
+            'epochs_completed': len(history.get('loss', [])),
+            'final_loss': float(history['loss'][-1]) if history.get('loss') else None,
+            'final_val_loss': float(history['val_loss'][-1]) if history.get('val_loss') else None,
             'test_prediction': test_result,
             'timestamp': datetime.now().isoformat()
         }
@@ -248,12 +368,34 @@ def batch_predict():
             }), 400
         
         symbols = data['symbols']
-        days = data.get('days', 60)
+        if not isinstance(symbols, list) or len(symbols) == 0:
+            return jsonify({
+                'error': 'Invalid symbols',
+                'message': 'Symbols must be a non-empty list'
+            }), 400
+        
+        # Limit batch size to prevent abuse
+        if len(symbols) > 10:
+            return jsonify({
+                'error': 'Too many symbols',
+                'message': 'Maximum 10 symbols allowed per batch request'
+            }), 400
+        
+        days = max(min(data.get('days', 60), 365), 90)  # Between 90 and 365
         results = []
         
         for symbol in symbols:
             try:
-                symbol = symbol.lower()
+                symbol = str(symbol).lower()
+                
+                if not validate_symbol(symbol):
+                    results.append({
+                        'symbol': symbol,
+                        'error': 'Invalid symbol',
+                        'message': 'Symbol must be a valid alphanumeric string'
+                    })
+                    continue
+                
                 predictor = load_predictor(symbol)
                 
                 if not predictor:
@@ -346,6 +488,13 @@ def model_info(symbol):
     """
     try:
         symbol = symbol.lower()
+        
+        if not validate_symbol(symbol):
+            return jsonify({
+                'error': 'Invalid symbol',
+                'message': 'Symbol must be a valid alphanumeric string'
+            }), 400
+        
         predictor = load_predictor(symbol)
         
         if not predictor:
@@ -356,14 +505,21 @@ def model_info(symbol):
         
         # Get model file info
         model_path = f"{MODEL_DIR}/{symbol}_improved_model.h5"
+        
+        if not os.path.exists(model_path):
+            return jsonify({
+                'error': 'Model file not found',
+                'message': f'Model file for {symbol} does not exist'
+            }), 404
+        
         stat = os.stat(model_path)
         
         model_info = {
             'symbol': symbol,
-            'sequence_length': predictor.sequence_length,
-            'lstm_units': predictor.lstm_units,
-            'dropout_rate': predictor.dropout_rate,
-            'is_trained': predictor.is_trained,
+            'sequence_length': getattr(predictor, 'sequence_length', 'N/A'),
+            'lstm_units': getattr(predictor, 'lstm_units', 'N/A'),
+            'dropout_rate': getattr(predictor, 'dropout_rate', 'N/A'),
+            'is_trained': getattr(predictor, 'is_trained', False),
             'model_size_mb': round(stat.st_size / (1024 * 1024), 2),
             'last_modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
             'is_cached': symbol in predictors_cache
@@ -385,6 +541,13 @@ def test_model(symbol):
     """
     try:
         symbol = symbol.lower()
+        
+        if not validate_symbol(symbol):
+            return jsonify({
+                'error': 'Invalid symbol',
+                'message': 'Symbol must be a valid alphanumeric string'
+            }), 400
+        
         predictor = load_predictor(symbol)
         
         if not predictor:
@@ -394,7 +557,7 @@ def test_model(symbol):
             }), 404
         
         # Get test data
-        days = request.args.get('days', 30, type=int)
+        days = max(min(request.args.get('days', 30, type=int), 90), 30)  # Between 30 and 90
         prices = get_crypto_data_api_improved(symbol, days)
         
         if not prices:
@@ -407,8 +570,12 @@ def test_model(symbol):
         result = predictor.predict(prices)
         
         # Calculate additional test metrics
-        price_volatility = np.std(prices[-10:]) / np.mean(prices[-10:])
-        price_trend = (prices[-1] - prices[-10]) / prices[-10] * 100
+        if len(prices) >= 10:
+            price_volatility = np.std(prices[-10:]) / np.mean(prices[-10:])
+            price_trend = (prices[-1] - prices[-10]) / prices[-10] * 100
+        else:
+            price_volatility = 0
+            price_trend = 0
         
         test_result = {
             'symbol': symbol,
@@ -438,130 +605,18 @@ def not_found(error):
 
 @app.errorhandler(500)
 def internal_error(error):
+    logger.error(f"Internal server error: {str(error)}")
     return jsonify({
         'error': 'Internal server error',
         'message': 'An unexpected error occurred'
     }), 500
 
-def get_crypto_data_api_improved(symbol='bitcoin', days=60):
-    """
-    Improved crypto data fetching with better error handling and more data.
-    """
-    try:
-        # Always fetch more data than requested to account for cleaning
-        fetch_days = min(max(days * 1.5, 90), 365)  # Ensure not more than 365
-        print(fetch_days)
-        url = f"https://api.coingecko.com/api/v3/coins/{symbol}/market_chart"
-        params = {
-            'vs_currency': 'usd', 
-            'days': fetch_days,
-            'interval': 'hourly' if fetch_days <= 30 else 'daily'
-        }
-        
-        print(f"Fetching {symbol} data for {fetch_days} days (requested: {days})")
-        
-        response = requests.get(url, params=params, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        
-        if 'prices' not in data or len(data['prices']) == 0:
-            raise ValueError("No price data received from API")
-        
-        prices = [float(price[1]) for price in data['prices']]
-        
-        print(f"Retrieved {len(prices)} price points")
-        
-        # Basic validation
-        if len(prices) < 50:
-            raise ValueError(f"Insufficient data from API: only {len(prices)} points")
-        
-        # If we have way more data than needed, trim to reasonable size for performance
-        if len(prices) > days * 3:
-            prices = prices[-(days * 2):]  # Keep last 2x requested days
-            print(f"Trimmed to {len(prices)} most recent price points")
-        
-        return prices
-        
-    except Exception as e:
-        logger.error(f"Error fetching {symbol} data: {e}")
-        return None
-
-# Update the predict endpoint in flask_api.py
-@app.route('/predict/<symbol>', methods=['GET', 'POST'])
-def predict_crypto_improved(symbol):
-    """
-    Improved prediction endpoint with better data handling.
-    """
-    try:
-        symbol = symbol.lower()
-        
-        # Load predictor
-        predictor = load_predictor(symbol)
-        if not predictor:
-            return jsonify({
-                'error': 'Model not found',
-                'message': f'No trained model available for {symbol}. Please train the model first.'
-            }), 404
-        
-        # Get price data
-        if request.method == 'GET':
-            days = request.args.get('days', 90, type=int)  # Increased default
-            days = max(days, 90)  # Ensure minimum
-            prices = get_crypto_data_api_improved(symbol, days)
-            
-            if not prices:
-                return jsonify({
-                    'error': 'Data fetch failed',
-                    'message': f'Could not fetch real-time data for {symbol}'
-                }), 500
-        
-        else:  # POST request
-            data = request.get_json()
-            if not data or 'prices' not in data:
-                return jsonify({
-                    'error': 'Invalid request',
-                    'message': 'POST request must contain "prices" field'
-                }), 400
-            
-            prices = data['prices']
-            
-            # Validate prices
-            try:
-                prices = [float(p) for p in prices]
-                if len(prices) < 90:
-                    return jsonify({
-                        'error': 'Insufficient data',
-                        'message': f'Need at least 90 price points, got {len(prices)}'
-                    }), 400
-            except (ValueError, TypeError):
-                return jsonify({
-                    'error': 'Invalid price data',
-                    'message': 'All prices must be valid numbers'
-                }), 400
-        
-        # Make prediction
-        result = predictor.predict(prices)
-        
-        # Add metadata
-        result.update({
-            'symbol': symbol,
-            'timestamp': datetime.now().isoformat(),
-            'current_price': prices[-1],
-            'total_data_points': len(prices),
-            'prediction_method': 'adaptive_lstm'
-        })
-        
-        logger.info(f"Prediction for {symbol}: {result['predicted_price']:.2f} ({result['direction']})")
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Error in prediction for {symbol}: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({
-            'error': 'Prediction failed',
-            'message': str(e)
-        }), 500
+@app.errorhandler(400)
+def bad_request(error):
+    return jsonify({
+        'error': 'Bad request',
+        'message': 'The request was invalid'
+    }), 400
 
 if __name__ == '__main__':
     # Create model directory if it doesn't exist

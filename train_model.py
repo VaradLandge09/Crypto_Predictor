@@ -1,20 +1,42 @@
+# Add these at the very top of train_model.py (BEFORE any other imports)
+import os
+import time
+import random
+
+# Suppress TensorFlow warnings and CUDA errors
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU/CUDA
+
 import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
-import time
-import os
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from crypto_predictor import ImprovedCryptoPricePredictor
 
-# Import the improved predictor
-# from improved_crypto_predictor import ImprovedCryptoPricePredictor
+# API rate limiting
+last_api_call = 0
+API_CALL_DELAY = 3  # seconds between API calls for training
 
 def get_crypto_data_with_validation(symbol='bitcoin', days=365, vs_currency='usd'):
     """
-    Fetch and validate historical crypto data from CoinGecko API with better error handling.
+    Fetch and validate historical crypto data from CoinGecko API with better error handling and rate limiting.
     """
+    global last_api_call
+    
     try:
+        # Rate limiting - wait between API calls
+        current_time = time.time()
+        time_since_last_call = current_time - last_api_call
+        if time_since_last_call < API_CALL_DELAY:
+            sleep_time = API_CALL_DELAY - time_since_last_call + random.uniform(1, 3)
+            print(f"Rate limiting: waiting {sleep_time:.1f} seconds...")
+            time.sleep(sleep_time)
+        
+        last_api_call = time.time()
+        
         url = f"https://api.coingecko.com/api/v3/coins/{symbol}/market_chart"
         params = {
             'vs_currency': vs_currency, 
@@ -23,7 +45,30 @@ def get_crypto_data_with_validation(symbol='bitcoin', days=365, vs_currency='usd
         }
         
         print(f"Fetching {symbol} data for {days} days...")
-        response = requests.get(url, params=params, timeout=10)
+        
+        # Create session with retry strategy
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            backoff_factor=3,
+            respect_retry_after_header=True
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        response = session.get(url, params=params, timeout=30)
+        
+        # Handle rate limiting specifically
+        if response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 120))
+            print(f"Rate limited. Waiting {retry_after + 10} seconds...")
+            time.sleep(retry_after + random.uniform(5, 15))
+            
+            # Retry once more
+            response = session.get(url, params=params, timeout=30)
+        
         response.raise_for_status()
         
         data = response.json()
@@ -54,6 +99,13 @@ def get_crypto_data_with_validation(symbol='bitcoin', days=365, vs_currency='usd
         
         return prices, timestamps
         
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            print(f"Rate limit exceeded for {symbol}. Please try again later or use smaller batch sizes.")
+            return None, None
+        else:
+            print(f"HTTP error fetching data: {e}")
+            return None, None
     except requests.exceptions.RequestException as e:
         print(f"Network error fetching data: {e}")
         return None, None
