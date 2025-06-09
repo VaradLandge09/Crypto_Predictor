@@ -7,6 +7,10 @@ from contextlib import contextmanager
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
+from dotenv import load_dotenv
+load_dotenv()
+
+
 # Suppress TensorFlow warnings and CUDA errors
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress all TensorFlow logs
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU/CUDA
@@ -47,95 +51,75 @@ executor = ThreadPoolExecutor(max_workers=2)
 
 def get_crypto_data_api_improved(symbol='bitcoin', days=60):
     """
-    Ultra-fast crypto data fetching with aggressive timeouts.
+    Fetch crypto closing prices from CoinMarketCap (free tier).
+    Returns a list of daily close prices.
     """
-    global last_api_call
-    
+    import datetime
+
     try:
-        # Very basic rate limiting
-        current_time = time.time()
-        if current_time - last_api_call < API_CALL_DELAY:
-            time.sleep(API_CALL_DELAY)
-        last_api_call = time.time()
-        
-        # Fetch minimal data for speed
-        fetch_days = min(max(days, 30), 90)  # Much smaller range
-        print(f"Fetch days calculated: {fetch_days}")
-        print(f"Fetching {symbol} data for {fetch_days} days (requested: {days})")
-        
-        url = f"https://api.coingecko.com/api/v3/coins/{symbol}/market_chart"
-        params = {
-            'vs_currency': 'usd', 
-            'days': fetch_days,
-            'interval': 'daily'
+        # CoinMarketCap uses symbols like BTC, ETH etc.
+        SYMBOL_MAP = {
+            'bitcoin': 'BTC',
+            'ethereum': 'ETH',
+            'dogecoin': 'DOGE',
+            # Add more mappings as needed
         }
-        
-        # Very aggressive session setup
+        cmc_symbol = SYMBOL_MAP.get(symbol.lower())
+        if not cmc_symbol:
+            raise ValueError(f"Unsupported symbol: {symbol}")
+
+        # Limit days
+        fetch_days = min(max(days, 30), 90)
+        print(f"Fetch days calculated: {fetch_days}")
+        print(f"Fetching {symbol} data from CoinMarketCap...")
+
+        # Time range
+        now = datetime.datetime.utcnow()
+        start = (now - datetime.timedelta(days=fetch_days)).strftime('%Y-%m-%d')
+        end = now.strftime('%Y-%m-%d')
+
+        # API request
+        api_key = os.getenv('CMC_API_KEY')
+        if not api_key:
+            raise EnvironmentError("CMC_API_KEY not set in environment variables")
+
+        url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/ohlcv/historical"
+        headers = {
+            'Accepts': 'application/json',
+            'X-CMC_PRO_API_KEY': api_key,
+        }
+        params = {
+            'symbol': cmc_symbol,
+            'time_start': start,
+            'time_end': end,
+            'interval': 'daily',
+            'convert': 'USD',
+        }
+
         session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (compatible; CryptoBot/1.0)',
-            'Accept': 'application/json',
-            'Connection': 'close'  # Don't keep connections alive
-        })
-        
-        # Minimal retry strategy
-        retry_strategy = Retry(
-            total=1,  # Only 1 retry
-            status_forcelist=[429, 500, 502, 503, 504],
-            backoff_factor=0.5,
-            respect_retry_after_header=False
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=1, pool_maxsize=1)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        
-        # Make request with very short timeout
-        print(f"Making API request to CoinGecko...")
-        response = session.get(url, params=params, timeout=MAX_REQUEST_TIMEOUT)
-        
-        # Quick rate limit handling
+        response = session.get(url, headers=headers, params=params, timeout=10)
+
         if response.status_code == 429:
-            print(f"Rate limited. Waiting 3 seconds...")
-            time.sleep(3)
-            response = session.get(url, params=params, timeout=MAX_REQUEST_TIMEOUT)
-        
+            logger.error(f"Rate limited by CoinMarketCap for {symbol}")
+            return None
+
         response.raise_for_status()
         data = response.json()
-        
-        if 'prices' not in data or len(data['prices']) == 0:
-            raise ValueError("No price data received from API")
-        
-        prices = [float(price[1]) for price in data['prices']]
-        print(f"Retrieved {len(prices)} price points")
-        
-        # Minimal validation
-        if len(prices) < 20:  # Reduced minimum
-            raise ValueError(f"Insufficient data from API: only {len(prices)} points")
-        
+
+        if 'data' not in data or 'quotes' not in data['data']:
+            raise ValueError("Invalid data from CoinMarketCap")
+
+        prices = [float(entry['quote']['USD']['close']) for entry in data['data']['quotes']]
+        if len(prices) < 20:
+            raise ValueError("Insufficient price history from CoinMarketCap")
+
+        print(f"Retrieved {len(prices)} price points from CMC")
         return prices
-        
-    except requests.exceptions.Timeout:
-        logger.error(f"API request timeout for {symbol}")
-        return None
-    except requests.exceptions.HTTPError as e:
-        if e.response and e.response.status_code == 429:
-            logger.error(f"Rate limit exceeded for {symbol}")
-            return None
-        else:
-            logger.error(f"HTTP error fetching {symbol} data: {e}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error fetching {symbol} data: {e}")
-        return None
+
     except Exception as e:
-        logger.error(f"Unexpected error fetching {symbol} data: {e}")
+        logger.error(f"Failed to fetch data from CoinMarketCap: {e}")
         return None
-    finally:
-        # Ensure session is closed
-        try:
-            session.close()
-        except:
-            pass
+
 
 def load_predictor_fast(symbol):
     """
