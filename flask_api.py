@@ -49,77 +49,192 @@ MAX_PREDICTION_TIMEOUT = 15  # Maximum time for entire prediction
 # Thread pool for non-blocking operations
 executor = ThreadPoolExecutor(max_workers=2)
 
-def get_crypto_data_api_improved(symbol='bitcoin', days=60):
-    """
-    Fetch crypto closing prices from CoinMarketCap (free tier).
-    Returns a list of daily close prices.
-    """
-    import datetime
+import requests
+import time
+import random
+from datetime import datetime, timedelta
 
+import requests
+import time
+import random
+from datetime import datetime, timedelta
+
+def get_crypto_data_with_fallback(symbol='bitcoin', days=90):
+    """
+    Try multiple free APIs with fallback system.
+    Increased default days to ensure we get enough data points.
+    """
+    
+    # Try CoinGecko first (with rate limiting)
+    data = try_coingecko(symbol, days)
+    if data:
+        return data
+    
+    # Fallback to Binance (no API key required for market data)
+    print("CoinGecko failed, trying Binance...")
+    data = try_binance(symbol, days)
+    if data:
+        return data
+    
+    # Fallback to CryptoCompare
+    print("Binance failed, trying CryptoCompare...")
+    data = try_cryptocompare(symbol, days)
+    if data:
+        return data
+    
+    print("All APIs failed")
+    return None
+
+def try_coingecko(symbol, days):
+    """Try CoinGecko with improved rate limiting."""
     try:
-        # CoinMarketCap uses symbols like BTC, ETH etc.
+        SYMBOL_MAP = {
+            'bitcoin': 'bitcoin',
+            'ethereum': 'ethereum',
+            'dogecoin': 'dogecoin'
+        }
+        
+        cg_symbol = SYMBOL_MAP.get(symbol.lower())
+        if not cg_symbol:
+            return None
+        
+        # Random delay to avoid rate limits
+        time.sleep(random.uniform(2, 5))
+        
+        # Ensure we request enough days to get 80+ data points
+        api_days = max(days, 90)  # Request at least 90 days
+        
+        url = f"https://api.coingecko.com/api/v3/coins/{cg_symbol}/market_chart"
+        params = {
+            'vs_currency': 'usd',
+            'days': min(api_days, 365),
+            'interval': 'daily'
+        }
+        
+        headers = {
+            'User-Agent': 'CryptoPredictionApp/1.0',
+            'Accept': 'application/json'
+        }
+        
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        
+        if response.status_code == 429:
+            print("CoinGecko rate limited")
+            return None
+            
+        response.raise_for_status()
+        data = response.json()
+        
+        prices = [price[1] for price in data['prices']]
+        
+        # Ensure we have enough data points
+        if len(prices) < 80:
+            print(f"CoinGecko: Only got {len(prices)} prices, need at least 80")
+            return None
+            
+        print(f"CoinGecko: Retrieved {len(prices)} prices for {symbol}")
+        return prices
+        
+    except Exception as e:
+        print(f"CoinGecko error: {e}")
+        return None
+
+def try_binance(symbol, days):
+    """Try Binance public API (no auth required)."""
+    try:
+        SYMBOL_MAP = {
+            'bitcoin': 'BTCUSDT',
+            'ethereum': 'ETHUSDT',
+            'dogecoin': 'DOGEUSDT'
+        }
+        
+        binance_symbol = SYMBOL_MAP.get(symbol.lower())
+        if not binance_symbol:
+            return None
+        
+        url = "https://api.binance.com/api/v3/klines"
+        
+        # Request more days to ensure we get enough data
+        api_days = max(days, 90)
+        
+        # Calculate start time (days ago)
+        end_time = int(time.time() * 1000)
+        start_time = end_time - (api_days * 24 * 60 * 60 * 1000)
+        
+        params = {
+            'symbol': binance_symbol,
+            'interval': '1d',
+            'startTime': start_time,
+            'endTime': end_time,
+            'limit': 1000  # Binance allows up to 1000
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Extract closing prices (index 4 in kline data)
+        prices = [float(kline[4]) for kline in data]
+        
+        # Ensure we have enough data points
+        if len(prices) < 80:
+            print(f"Binance: Only got {len(prices)} prices, need at least 80")
+            return None
+            
+        print(f"Binance: Retrieved {len(prices)} prices for {symbol}")
+        return prices
+        
+    except Exception as e:
+        print(f"Binance error: {e}")
+        return None
+
+def try_cryptocompare(symbol, days):
+    """Try CryptoCompare API (free tier)."""
+    try:
         SYMBOL_MAP = {
             'bitcoin': 'BTC',
             'ethereum': 'ETH',
-            'dogecoin': 'DOGE',
-            # Add more mappings as needed
+            'dogecoin': 'DOGE'
         }
-        cmc_symbol = SYMBOL_MAP.get(symbol.lower())
-        if not cmc_symbol:
-            raise ValueError(f"Unsupported symbol: {symbol}")
-
-        # Limit days
-        fetch_days = min(max(days, 30), 90)
-        print(f"Fetch days calculated: {fetch_days}")
-        print(f"Fetching {symbol} data from CoinMarketCap...")
-
-        # Time range
-        now = datetime.datetime.utcnow()
-        start = (now - datetime.timedelta(days=fetch_days)).strftime('%Y-%m-%d')
-        end = now.strftime('%Y-%m-%d')
-
-        # API request
-        api_key = os.getenv('CMC_API_KEY')
-        if not api_key:
-            raise EnvironmentError("CMC_API_KEY not set in environment variables")
-
-        url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/ohlcv/historical"
-        headers = {
-            'Accepts': 'application/json',
-            'X-CMC_PRO_API_KEY': api_key,
-        }
-        params = {
-            'symbol': cmc_symbol,
-            'time_start': start,
-            'time_end': end,
-            'interval': 'daily',
-            'convert': 'USD',
-        }
-
-        session = requests.Session()
-        response = session.get(url, headers=headers, params=params, timeout=10)
-
-        if response.status_code == 429:
-            logger.error(f"Rate limited by CoinMarketCap for {symbol}")
+        
+        cc_symbol = SYMBOL_MAP.get(symbol.lower())
+        if not cc_symbol:
             return None
-
+        
+        # Request more days to ensure we get enough data
+        api_days = max(days, 90)
+        
+        url = "https://min-api.cryptocompare.com/data/v2/histoday"
+        params = {
+            'fsym': cc_symbol,
+            'tsym': 'USD',
+            'limit': min(api_days, 2000),  # CryptoCompare allows up to 2000
+            'toTs': int(time.time())
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
+        
         data = response.json()
-
-        if 'data' not in data or 'quotes' not in data['data']:
-            raise ValueError("Invalid data from CoinMarketCap")
-
-        prices = [float(entry['quote']['USD']['close']) for entry in data['data']['quotes']]
-        if len(prices) < 20:
-            raise ValueError("Insufficient price history from CoinMarketCap")
-
-        print(f"Retrieved {len(prices)} price points from CMC")
+        
+        if data['Response'] != 'Success':
+            return None
+            
+        # Extract closing prices
+        prices = [day['close'] for day in data['Data']['Data']]
+        
+        # Ensure we have enough data points
+        if len(prices) < 80:
+            print(f"CryptoCompare: Only got {len(prices)} prices, need at least 80")
+            return None
+            
+        print(f"CryptoCompare: Retrieved {len(prices)} prices for {symbol}")
         return prices
-
+        
     except Exception as e:
-        logger.error(f"Failed to fetch data from CoinMarketCap: {e}")
+        print(f"CryptoCompare error: {e}")
         return None
-
 
 def load_predictor_fast(symbol):
     """
@@ -216,7 +331,7 @@ def predict_crypto(symbol):
         if request.method == 'GET':
             days = min(max(request.args.get('days', 30, type=int), 30), 90)  # Smaller range
             
-            prices = get_crypto_data_api_improved(symbol, days)
+            prices = get_crypto_data_with_fallback(symbol, days)
             
             if not prices:
                 return jsonify({
@@ -304,7 +419,7 @@ def train_model_endpoint(symbol):
         logger.info(f"Starting training for {symbol} with {days} days, {epochs} epochs")
         
         # Fetch training data
-        prices = get_crypto_data_api_improved(symbol, days)
+        prices = get_crypto_data_with_fallback(symbol, days)
         if not prices:
             return jsonify({
                 'error': 'Data fetch failed'
