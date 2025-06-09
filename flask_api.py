@@ -7,10 +7,6 @@ from contextlib import contextmanager
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
-from dotenv import load_dotenv
-load_dotenv()
-
-
 # Suppress TensorFlow warnings and CUDA errors
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress all TensorFlow logs
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU/CUDA
