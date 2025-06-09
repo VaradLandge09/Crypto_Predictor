@@ -1,1 +1,1 @@
-web: gunicorn flask_api:app
+gunicorn -c gunicorn.conf.py flask_api:app
