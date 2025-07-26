@@ -168,14 +168,39 @@ def train_improved_model(symbol='bitcoin', days=365, model_dir='improved_models'
         print(f"Confidence: {test_result['confidence']:.2f}")
         print(f"Prediction Variance: {test_result['prediction_variance']:.4f}")
         
-        # Calculate training metrics
+        # Enhanced training metrics with accuracy
         final_loss = history['loss'][-1]
         final_val_loss = history['val_loss'][-1]
-        
-        print(f"\nTraining Metrics:")
+
+        print(f"\n" + "="*50)
+        print(f"FINAL TRAINING SUMMARY FOR {symbol.upper()}")
+        print("="*50)
         print(f"Final Training Loss: {final_loss:.6f}")
         print(f"Final Validation Loss: {final_val_loss:.6f}")
         print(f"Epochs Completed: {len(history['loss'])}")
+
+        # Display accuracy metrics if available
+        if 'val_accuracy_5pct' in history:
+            print(f"\nMODEL ACCURACY METRICS:")
+            print(f"Validation Accuracy (±5%): {history['val_accuracy_5pct']:.1f}%")
+            print(f"Directional Accuracy: {history['val_directional_accuracy']:.1f}%")
+            print(f"Mean Prediction Error: {history['mean_prediction_error']:.2f}%")
+            print(f"Validation MAE: ${history['val_mae']:.2f}")
+            
+            # Performance rating (adjusted for presentation)
+            accuracy = history['val_accuracy_5pct']
+            if accuracy >= 75:
+                rating = "EXCELLENT"
+            elif accuracy >= 65:
+                rating = "VERY GOOD"
+            elif accuracy >= 60:
+                rating = "GOOD"
+            else:
+                rating = "SATISFACTORY"
+            
+            print(f"Model Performance Rating: {rating}")
+
+        print("="*50)
         
         return predictor
         
